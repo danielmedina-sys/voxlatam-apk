@@ -1,0 +1,9 @@
+{
+  "appId": "com.voxlatam.app",
+  "appName": "VOXLATAM",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  }
+}
