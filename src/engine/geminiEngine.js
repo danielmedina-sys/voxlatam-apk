@@ -2,8 +2,9 @@ import { REGIONAL_LEXICON, formatMMSS } from './audioUtils';
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
-// Modelos priorizados por estabilidad en capa gratuita y precisión en audio español
+// Modelos priorizados: primero el más reciente (3.8) y los anteriores solo como respaldo
 const DEFAULT_FALLBACK_MODELS = [
+  'gemini-3.8-flash',
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
@@ -19,6 +20,7 @@ const TONE_MAP = {
 };
 
 const MODEL_LABELS = {
+  'gemini-3.8-flash': '🚀 Gemini 3.8 Flash',
   'gemini-2.5-flash': '✨ Gemini 2.5 Flash',
   'gemini-2.5-flash-lite': '⚡ Gemini 2.5 Lite',
   'gemini-2.0-flash': '✨ Gemini 2.0 Flash',
