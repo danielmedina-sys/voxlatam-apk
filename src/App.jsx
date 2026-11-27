@@ -49,9 +49,9 @@ import {
   deleteVaultSession,
 } from './engine/storage';
 import {
-  transcribeWithGroq,
-  testGroqConnection,
-} from './engine/groqEngine';
+  transcribeWithGemini,
+  testGeminiConnection,
+} from './engine/geminiEngine';
 
 const REGIONS = [
   { id: 'Multi-LATAM', flag: '🌎', label: 'Multi-LATAM' },
@@ -79,18 +79,24 @@ const SPEAKER_PALETTE = [
   '#FB7185',
 ];
 
-const GROQ_MODELS = [
+const GEMINI_MODELS = [
   {
-    id: 'whisper-large-v3-turbo',
-    name: 'Whisper Large-v3 Turbo',
-    tag: 'Recomendado · 98%',
-    desc: 'Ultra veloz (<1s por minuto) y altísima precisión en español latino y WhatsApp.',
+    id: 'auto',
+    name: 'Automático Inteligente',
+    tag: 'Recomendado · Anti-cuota',
+    desc: 'Usa Gemini 2.5 Flash en 1 sola llamada y rota solo a modelos de respaldo si hay alta demanda.',
   },
   {
-    id: 'whisper-large-v3',
-    name: 'Whisper Large-v3 Completo',
-    tag: 'Máxima precisión',
-    desc: 'Ideal para audios difíciles con ruido de fondo, varias personas o voz lejana.',
+    id: 'gemini-2.5-flash',
+    name: 'Gemini 2.5 Flash',
+    tag: 'Máxima precisión · 98%',
+    desc: 'Excelente reconocimiento de voces múltiples, tonos y modismos latinos.',
+  },
+  {
+    id: 'gemini-2.5-flash-lite',
+    name: 'Gemini 2.5 Flash-Lite',
+    tag: 'Mayor cuota gratis',
+    desc: 'Ultra rápido y con límites gratuitos más amplios para uso intensivo diario.',
   },
 ];
 
@@ -133,15 +139,15 @@ export default function App() {
   const [engineMode, setEngineMode] = useState(
     () => localStorage.getItem('vox_engine_mode') || 'hybrid'
   );
-  const [groqApiKey, setGroqApiKey] = useState(
-    () => localStorage.getItem('vox_groq_key') || ''
+  const [geminiApiKey, setGeminiApiKey] = useState(
+    () => localStorage.getItem('vox_gemini_key') || ''
   );
-  const [groqModel, setGroqModel] = useState(
-    () => localStorage.getItem('vox_groq_model') || 'whisper-large-v3-turbo'
+  const [geminiModel, setGeminiModel] = useState(
+    () => localStorage.getItem('vox_gemini_model') || 'auto'
   );
   const [showKeyText, setShowKeyText] = useState(false);
-  const [testingGroq, setTestingGroq] = useState(false);
-  const [groqTestStatus, setGroqTestStatus] = useState(null);
+  const [testingGemini, setTestingGemini] = useState(false);
+  const [geminiTestStatus, setGeminiTestStatus] = useState(null);
   const [modelId, setModelId] = useState(
     () => localStorage.getItem('vox_model') || 'Xenova/whisper-small'
   );
@@ -221,12 +227,12 @@ export default function App() {
   }, [engineMode]);
 
   useEffect(() => {
-    localStorage.setItem('vox_groq_key', groqApiKey.trim());
-  }, [groqApiKey]);
+    localStorage.setItem('vox_gemini_key', geminiApiKey.trim());
+  }, [geminiApiKey]);
 
   useEffect(() => {
-    localStorage.setItem('vox_groq_model', groqModel);
-  }, [groqModel]);
+    localStorage.setItem('vox_gemini_model', geminiModel);
+  }, [geminiModel]);
 
   useEffect(() => {
     localStorage.setItem('vox_glossary', JSON.stringify(customGlossary));
@@ -454,16 +460,34 @@ export default function App() {
     }
 
     try {
-      // 2. Decodificar y normalizar audio a 16kHz Mono para máxima nitidez
-      setProcessMessage('Optimizando volumen y nitidez de la voz...');
+      // 2. Decodificar y normalizar audio a 16kHz Mono (tolerante a formatos especiales de WhatsApp)
+      setProcessMessage('Optimizando volumen y preparando audio...');
       setProcessProgress(14);
-      const decoded = await decodeAudioTo16kHzMono(blob);
-      const samples = normalizeAudioSamples(decoded.samples);
-      const { sampleRate, duration } = decoded;
+
+      let samples = null;
+      let sampleRate = 16000;
+      let duration = recordSeconds || 0;
+
+      try {
+        const decoded = await decodeAudioTo16kHzMono(blob);
+        samples = normalizeAudioSamples(decoded.samples);
+        sampleRate = decoded.sampleRate;
+        duration = decoded.duration;
+      } catch {
+        // Si Android WebView no decodifica un códec especial (ej. .opus), Gemini igual lo procesa directo
+        samples = null;
+      }
 
       // Función auxiliar de respaldo Offline (en el teléfono)
-      const runOfflineTranscription = () =>
-        new Promise((resolve, reject) => {
+      const runOfflineTranscription = () => {
+        if (!samples) {
+          return Promise.reject(
+            new Error(
+              'Este formato de audio requiere el modo Google AI Studio (con internet) para procesarse.'
+            )
+          );
+        }
+        return new Promise((resolve, reject) => {
           const worker = getWorker();
           const handleMsg = (ev) => {
             const data = ev.data;
@@ -491,109 +515,160 @@ export default function App() {
             modelId,
           });
         });
-
-      // 3. Ejecutar Whisper Large-v3 (Groq Gratis) con respaldo automático Offline
-      let whisperOutput = null;
-      const canUseGroq =
-        engineMode === 'hybrid' && groqApiKey.trim().length > 10 && navigator.onLine !== false;
-
-      if (canUseGroq) {
-        try {
-          setProcessMessage('Conectando con Whisper Large-v3 (98% precisión)...');
-          setProcessProgress(26);
-          whisperOutput = await transcribeWithGroq({
-            samples,
-            sampleRate,
-            duration,
-            apiKey: groqApiKey,
-            model: groqModel,
-            region: selectedRegion,
-            glossary: customGlossary,
-            onProgress: (pct, msg) => {
-              setProcessProgress(pct);
-              setProcessMessage(msg);
-            },
-          });
-        } catch (groqErr) {
-          if (groqErr?.message === 'INVALID_GROQ_KEY') {
-            showToast('Clave Groq inválida: revisa el botón del chip. Usando modo offline...');
-          } else {
-            showToast('Sin acceso a Groq en este momento: cambiando a respaldo offline...');
-          }
-          whisperOutput = await runOfflineTranscription();
-        }
-      } else {
-        whisperOutput = await runOfflineTranscription();
-      }
-
-      // 4. Separación automática de Hablante 1, Hablante 2... y análisis de Tono
-      setProcessMessage('Separando hablantes y midiendo tonos de voz...');
-      setProcessProgress(94);
-
-      const rawChunks =
-        whisperOutput?.chunks && whisperOutput.chunks.length > 0
-          ? whisperOutput.chunks
-          : whisperOutput?.text
-          ? [{ text: whisperOutput.text, timestamp: [0, duration] }]
-          : [];
-
-      const turns = refineChunksIntoTurns(rawChunks, samples, sampleRate, duration);
-
-      // Calcular RMS base de todo el audio para medir energía relativa
-      let sumSq = 0;
-      const stride = Math.max(1, Math.floor(samples.length / 12000));
-      let count = 0;
-      for (let i = 0; i < samples.length; i += stride) {
-        sumSq += samples[i] * samples[i];
-        count++;
-      }
-      const baselineRms = Math.sqrt(sumSq / Math.max(1, count));
+      };
 
       const slangPool = [
         ...(REGIONAL_LEXICON[selectedRegion] || REGIONAL_LEXICON['Multi-LATAM']),
         ...customGlossary,
       ].map((w) => w.toLowerCase());
 
-      const enrichedSegments = turns.map((turn, idx) => {
-        const cleanText = applyGlossaryFixes(turn.text, customGlossary);
-        const profile = extractVoiceProfile(samples, sampleRate, turn.start, turn.end);
-        const tone = classifyVoiceTone(
-          profile,
-          cleanText,
-          Math.max(0.4, turn.end - turn.start),
-          baselineRms
-        );
-        const slangHits = slangPool.filter((term) => {
-          if (!term) return false;
-          const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          return new RegExp(`(^|[^a-záéíóúüñ])${escaped}([^a-záéíóúüñ]|$)`, 'i').test(
-            cleanText.toLowerCase()
-          );
+      // 3. Intentar primero con Google AI Studio (1 sola petición unificada + rotación automática de modelos)
+      let geminiResult = null;
+      const canUseGemini =
+        engineMode === 'hybrid' && geminiApiKey.trim().length > 15 && navigator.onLine !== false;
+
+      if (canUseGemini) {
+        try {
+          setProcessMessage('Conectando con Google AI Studio (1 sola llamada)...');
+          setProcessProgress(24);
+          geminiResult = await transcribeWithGemini({
+            blob,
+            fileName: blob.name || title || 'audio.webm',
+            duration,
+            apiKey: geminiApiKey,
+            preferredModel: geminiModel,
+            region: selectedRegion,
+            glossary: customGlossary,
+            speakerMode,
+            onProgress: (pct, msg) => {
+              setProcessProgress(pct);
+              setProcessMessage(msg);
+            },
+          });
+        } catch (gemErr) {
+          if (gemErr?.message === 'INVALID_GEMINI_KEY') {
+            showToast('API Key inválida: revísala en el botón del Chip. Usando respaldo offline...');
+          } else {
+            showToast('Servidores ocupados o sin red: usando respaldo offline automático...');
+          }
+          geminiResult = null;
+        }
+      }
+
+      let enrichedSegments = [];
+      let smartNotes = null;
+      let engineLabel = '📱 Offline Local';
+
+      if (geminiResult) {
+        setProcessMessage('Organizando diálogos, tonos y notas...');
+        setProcessProgress(94);
+        engineLabel = geminiResult.engineLabel || '✨ Gemini Flash';
+
+        enrichedSegments = (geminiResult.segments || []).map((seg, idx) => {
+          const cleanText = applyGlossaryFixes(seg.text, customGlossary);
+          const profile = samples
+            ? extractVoiceProfile(samples, sampleRate, seg.start, seg.end)
+            : null;
+          const slangHits = slangPool.filter((term) => {
+            if (!term) return false;
+            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(`(^|[^a-záéíóúüñ])${escaped}([^a-záéíóúüñ]|$)`, 'i').test(
+              cleanText.toLowerCase()
+            );
+          });
+
+          return {
+            id: `seg_${idx}`,
+            start: seg.start,
+            end: seg.end,
+            timestamp: seg.timestamp || formatMMSS(seg.start),
+            speaker: seg.speaker || 'Hablante 1',
+            text: cleanText,
+            voiceVector: profile?.vector || [155, 20, 0.08, 0, 0, 0, 0, 0, 0, 0, 0],
+            tone: seg.tone,
+            slangHits: Array.from(new Set(slangHits)),
+          };
         });
 
-        return {
-          id: `seg_${idx}`,
-          start: turn.start,
-          end: turn.end,
-          timestamp: formatMMSS(turn.start),
-          text: cleanText,
-          voiceVector: profile.vector,
-          tone,
-          slangHits: Array.from(new Set(slangHits)),
+        if (duration <= 0 && enrichedSegments.length > 0) {
+          duration = enrichedSegments[enrichedSegments.length - 1].end || 0;
+        }
+
+        const baseNotes = generateSmartNotes(enrichedSegments, selectedRegion, customGlossary);
+        smartNotes = {
+          ...baseNotes,
+          summary: geminiResult.summary || baseNotes.summary,
+          detectedSlang: Array.from(
+            new Set([...(baseNotes.detectedSlang || []), ...(geminiResult.detectedSlang || [])])
+          ),
         };
-      });
+      } else {
+        // 4. Respaldo Offline (en el teléfono)
+        const whisperOutput = await runOfflineTranscription();
+        engineLabel = whisperOutput?.engineLabel || '📱 Offline Local';
 
-      const autoSpeakers = clusterSpeakersByVoice(enrichedSegments, speakerMode);
-      enrichedSegments.forEach((seg, idx) => {
-        seg.speaker = autoSpeakers[idx];
-      });
+        setProcessMessage('Separando hablantes y midiendo tonos de voz...');
+        setProcessProgress(94);
 
-      const smartNotes = generateSmartNotes(enrichedSegments, selectedRegion, customGlossary);
+        const rawChunks =
+          whisperOutput?.chunks && whisperOutput.chunks.length > 0
+            ? whisperOutput.chunks
+            : whisperOutput?.text
+            ? [{ text: whisperOutput.text, timestamp: [0, duration] }]
+            : [];
+
+        const turns = refineChunksIntoTurns(rawChunks, samples, sampleRate, duration);
+
+        let sumSq = 0;
+        const stride = Math.max(1, Math.floor(samples.length / 12000));
+        let count = 0;
+        for (let i = 0; i < samples.length; i += stride) {
+          sumSq += samples[i] * samples[i];
+          count++;
+        }
+        const baselineRms = Math.sqrt(sumSq / Math.max(1, count));
+
+        enrichedSegments = turns.map((turn, idx) => {
+          const cleanText = applyGlossaryFixes(turn.text, customGlossary);
+          const profile = extractVoiceProfile(samples, sampleRate, turn.start, turn.end);
+          const tone = classifyVoiceTone(
+            profile,
+            cleanText,
+            Math.max(0.4, turn.end - turn.start),
+            baselineRms
+          );
+          const slangHits = slangPool.filter((term) => {
+            if (!term) return false;
+            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(`(^|[^a-záéíóúüñ])${escaped}([^a-záéíóúüñ]|$)`, 'i').test(
+              cleanText.toLowerCase()
+            );
+          });
+
+          return {
+            id: `seg_${idx}`,
+            start: turn.start,
+            end: turn.end,
+            timestamp: formatMMSS(turn.start),
+            text: cleanText,
+            voiceVector: profile.vector,
+            tone,
+            slangHits: Array.from(new Set(slangHits)),
+          };
+        });
+
+        const autoSpeakers = clusterSpeakersByVoice(enrichedSegments, speakerMode);
+        enrichedSegments.forEach((seg, idx) => {
+          seg.speaker = autoSpeakers[idx];
+        });
+
+        smartNotes = generateSmartNotes(enrichedSegments, selectedRegion, customGlossary);
+      }
 
       const completedSession = {
         ...draftSession,
         status: 'ready',
-        engineLabel: whisperOutput?.engineLabel || '📱 Offline Local',
+        engineLabel,
         duration: Number(duration.toFixed(2)),
         durationFormatted: formatMMSS(duration),
         segments: enrichedSegments,
@@ -789,8 +864,8 @@ export default function App() {
           <div>
             <span className="font-bold tracking-wider text-base">VOXLATAM</span>
             <span className={`block text-[10px] leading-none ${mutedTextClass}`}>
-              {engineMode === 'hybrid' && groqApiKey.trim()
-                ? `${groqModel === 'whisper-large-v3' ? 'Large-v3' : 'Large-v3 Turbo'} · Híbrido`
+              {engineMode === 'hybrid' && geminiApiKey.trim()
+                ? 'Gemini Flash · Híbrido'
                 : 'IA Local · Offline'}
             </span>
           </div>
@@ -833,7 +908,7 @@ export default function App() {
         {/* PESTAÑA 1: GRABAR */}
         {activeTab === 'record' && (
           <div className="space-y-4">
-            {engineMode === 'hybrid' && !groqApiKey.trim() && (
+            {engineMode === 'hybrid' && !geminiApiKey.trim() && (
               <div
                 className={`rounded-2xl border p-3.5 flex items-center justify-between gap-3 ${surfaceClass}`}
                 style={{ borderColor: `${primaryColor}60` }}
@@ -847,10 +922,10 @@ export default function App() {
                   </div>
                   <div className="min-w-0">
                     <div className="text-xs font-bold truncate">
-                      Activa Whisper Large-v3 (98% gratis)
+                      Activa Google AI Studio (98% precisión)
                     </div>
                     <div className={`text-[11px] truncate ${mutedTextClass}`}>
-                      Pega tu clave gratuita de Groq para precisión exacta
+                      1 sola llamada por audio + respaldo automático
                     </div>
                   </div>
                 </div>
@@ -1521,16 +1596,16 @@ export default function App() {
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-bold flex items-center gap-1.5">
                     <KeyRound className="w-3.5 h-3.5" style={{ color: primaryColor }} />
-                    Clave gratuita de Groq (Sin tarjeta)
+                    API Key de Google AI Studio
                   </span>
                   <a
-                    href="https://console.groq.com/keys"
+                    href="https://aistudio.google.com/app/apikey"
                     target="_blank"
                     rel="noreferrer"
                     className="text-[11px] font-semibold flex items-center gap-1 underline"
                     style={{ color: primaryColor }}
                   >
-                    Crear clave
+                    Ver mi clave
                     <ExternalLink className="w-3 h-3" />
                   </a>
                 </div>
@@ -1539,12 +1614,12 @@ export default function App() {
                   <div className="relative flex-1">
                     <input
                       type={showKeyText ? 'text' : 'password'}
-                      value={groqApiKey}
+                      value={geminiApiKey}
                       onChange={(e) => {
-                        setGroqApiKey(e.target.value);
-                        setGroqTestStatus(null);
+                        setGeminiApiKey(e.target.value);
+                        setGeminiTestStatus(null);
                       }}
-                      placeholder="Pega aquí tu clave gsk_..."
+                      placeholder="Pega aquí tu clave AIza..."
                       className={`w-full pl-3 pr-9 py-2 rounded-xl border text-xs bg-transparent outline-none font-mono ${
                         isLight ? 'border-slate-300' : 'border-zinc-700'
                       }`}
@@ -1559,41 +1634,41 @@ export default function App() {
                   </div>
                   <button
                     type="button"
-                    disabled={testingGroq}
+                    disabled={testingGemini}
                     onClick={async () => {
-                      setTestingGroq(true);
-                      const res = await testGroqConnection(groqApiKey);
-                      setGroqTestStatus(res);
-                      setTestingGroq(false);
+                      setTestingGemini(true);
+                      const res = await testGeminiConnection(geminiApiKey);
+                      setGeminiTestStatus(res);
+                      setTestingGemini(false);
                     }}
                     className="px-3 py-2 rounded-xl text-xs font-bold text-black shrink-0 disabled:opacity-50"
                     style={gradientStyle}
                   >
-                    {testingGroq ? '...' : 'Probar'}
+                    {testingGemini ? '...' : 'Probar'}
                   </button>
                 </div>
 
-                {groqTestStatus && (
+                {geminiTestStatus && (
                   <p
                     className={`text-[11px] font-medium ${
-                      groqTestStatus.ok ? 'text-emerald-400' : 'text-rose-400'
+                      geminiTestStatus.ok ? 'text-emerald-400' : 'text-rose-400'
                     }`}
                   >
-                    {groqTestStatus.ok ? '✓ ' : '✕ '}
-                    {groqTestStatus.message}
+                    {geminiTestStatus.ok ? '✓ ' : '✕ '}
+                    {geminiTestStatus.message}
                   </p>
                 )}
 
                 <div className="space-y-1.5 pt-1">
                   <span className={`text-[11px] font-semibold ${mutedTextClass}`}>
-                    Modelo con internet (2.000 audios gratis/día):
+                    Estrategia de modelos (1 sola llamada por audio):
                   </span>
-                  {GROQ_MODELS.map((gm) => {
-                    const selected = groqModel === gm.id;
+                  {GEMINI_MODELS.map((gm) => {
+                    const selected = geminiModel === gm.id;
                     return (
                       <button
                         key={gm.id}
-                        onClick={() => setGroqModel(gm.id)}
+                        onClick={() => setGeminiModel(gm.id)}
                         className={`w-full text-left p-2.5 rounded-xl border transition ${
                           selected
                             ? 'border-current'
@@ -1746,7 +1821,7 @@ export default function App() {
                     </div>
 
                     <div className="flex items-center gap-1.5">
-                      {sess.status !== 'ready' && sess.audioBlob && (
+                      {sess.audioBlob && (
                         <button
                           onClick={() => {
                             setShowVaultModal(false);
@@ -1754,7 +1829,7 @@ export default function App() {
                           }}
                           className="p-1.5 rounded-lg text-black"
                           style={gradientStyle}
-                          title="Transcribir ahora"
+                          title="Transcribir o reprocesar ahora"
                         >
                           <RefreshCw className="w-3.5 h-3.5" />
                         </button>
