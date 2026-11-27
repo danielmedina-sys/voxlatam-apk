@@ -488,3 +488,67 @@ export function generateSmartNotes(segments, region, customTerms = []) {
     speakerStats,
   };
 }
+
+
+export function normalizeAudioSamples(samples) {
+  if (!samples || samples.length === 0) return samples;
+  const out = new Float32Array(samples.length);
+
+  // 1. Eliminar desplazamiento DC (evita sesgos en grabaciones de Android)
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) sum += samples[i];
+  const mean = sum / samples.length;
+
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const centered = samples[i] - mean;
+    out[i] = centered;
+    const abs = Math.abs(centered);
+    if (abs > peak) peak = abs;
+  }
+
+  // 2. Normalizar volumen si la grabación quedó baja (sin amplificar silencio puro)
+  if (peak > 0.004 && peak < 0.88) {
+    const gain = Math.min(8.0, 0.92 / peak);
+    for (let i = 0; i < out.length; i++) {
+      const boosted = out[i] * gain;
+      out[i] = boosted > 1 ? 1 : boosted < -1 ? -1 : boosted;
+    }
+  }
+
+  return out;
+}
+
+export function encodeWav16kMono(samples, sampleRate = 16000) {
+  const numSamples = samples.length;
+  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buffer);
+
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM
+  view.setUint16(20, 1, true); // Linear PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, numSamples * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}

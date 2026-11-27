@@ -26,32 +26,32 @@ async function ensurePipeline(modelId, reportProgress) {
 }
 
 self.onmessage = async (event) => {
-  const { id, type, audioSamples, modelId = 'Xenova/whisper-base' } = event.data;
+  const { id, type, audioSamples, duration = 0, modelId = 'Xenova/whisper-small' } = event.data;
 
   if (type === 'TRANSCRIBE') {
     try {
       self.postMessage({
         id,
         status: 'loading_model',
-        progress: 8,
-        message: 'Inicializando motor neuronal en tu teléfono...',
+        progress: 12,
+        message: 'Inicializando motor offline en tu teléfono...',
       });
 
       const transcriber = await ensurePipeline(modelId, (prog) => {
         if (prog.status === 'progress' && typeof prog.progress === 'number') {
-          const pct = Math.max(5, Math.min(99, Math.round(prog.progress)));
+          const pct = Math.max(10, Math.min(99, Math.round(prog.progress)));
           self.postMessage({
             id,
             status: 'downloading',
             progress: pct,
-            message: `Guardando motor IA en memoria (${pct}%) · Solo la 1ra vez`,
+            message: `Guardando motor offline (${pct}%) · Solo la 1ra vez`,
           });
         } else if (prog.status === 'ready') {
           self.postMessage({
             id,
             status: 'transcribing',
-            progress: 100,
-            message: 'Transcribiendo voces y modismos en español...',
+            progress: 86,
+            message: 'Transcribiendo en modo offline...',
           });
         }
       });
@@ -59,22 +59,34 @@ self.onmessage = async (event) => {
       self.postMessage({
         id,
         status: 'transcribing',
-        progress: 100,
-        message: 'Reconociendo palabras y marcas de tiempo...',
+        progress: 88,
+        message: 'Reconociendo palabras en español (modo offline)...',
       });
 
-      const output = await transcriber(audioSamples, {
+      // Evitar cortes chunk_length_s en audios cortos (<=28s) para no dañar la precisión en español
+      const options = {
         language: 'spanish',
         task: 'transcribe',
-        chunk_length_s: 28,
-        stride_length_s: 5,
         return_timestamps: true,
-      });
+        no_repeat_ngram_size: 3,
+        repetition_penalty: 1.15,
+        condition_on_previous_text: false,
+      };
+
+      if (duration > 28) {
+        options.chunk_length_s = 28;
+        options.stride_length_s = 5;
+      }
+
+      const output = await transcriber(audioSamples, options);
 
       self.postMessage({
         id,
         status: 'done',
-        result: output,
+        result: {
+          ...output,
+          engineLabel: '📱 Offline Local',
+        },
       });
     } catch (err) {
       self.postMessage({
@@ -82,7 +94,7 @@ self.onmessage = async (event) => {
         status: 'error',
         error:
           err?.message ||
-          'No se pudo inicializar el modelo. Verifica tener conexión la primera vez para guardarlo en el teléfono.',
+          'No se pudo ejecutar el motor offline. Verifica tu conexión para descargarlo la primera vez.',
       });
     }
   }

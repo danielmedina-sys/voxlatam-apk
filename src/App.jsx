@@ -24,11 +24,18 @@ import {
   Users,
   FileText,
   MessageSquare,
+  Zap,
+  WifiOff,
+  KeyRound,
+  ExternalLink,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import {
   REGIONAL_LEXICON,
   formatMMSS,
   decodeAudioTo16kHzMono,
+  normalizeAudioSamples,
   refineChunksIntoTurns,
   extractVoiceProfile,
   clusterSpeakersByVoice,
@@ -41,6 +48,10 @@ import {
   getAllVaultSessions,
   deleteVaultSession,
 } from './engine/storage';
+import {
+  transcribeWithGroq,
+  testGroqConnection,
+} from './engine/groqEngine';
 
 const REGIONS = [
   { id: 'Multi-LATAM', flag: '🌎', label: 'Multi-LATAM' },
@@ -68,24 +79,39 @@ const SPEAKER_PALETTE = [
   '#FB7185',
 ];
 
+const GROQ_MODELS = [
+  {
+    id: 'whisper-large-v3-turbo',
+    name: 'Whisper Large-v3 Turbo',
+    tag: 'Recomendado · 98%',
+    desc: 'Ultra veloz (<1s por minuto) y altísima precisión en español latino y WhatsApp.',
+  },
+  {
+    id: 'whisper-large-v3',
+    name: 'Whisper Large-v3 Completo',
+    tag: 'Máxima precisión',
+    desc: 'Ideal para audios difíciles con ruido de fondo, varias personas o voz lejana.',
+  },
+];
+
 const MODELS = [
   {
     id: 'Xenova/whisper-tiny',
     name: 'Ultraligero (Whisper Tiny)',
     size: '~40 MB',
-    desc: 'Muy veloz. Ideal para teléfonos con poca memoria o audios largos.',
+    desc: 'Respaldo veloz sin internet para teléfonos con poca memoria.',
   },
   {
     id: 'Xenova/whisper-base',
     name: 'Equilibrado (Whisper Base)',
     size: '~74 MB',
-    desc: 'Recomendado. Excelente balance entre rapidez y precisión en español.',
+    desc: 'Respaldo offline equilibrado si te quedas sin señal.',
   },
   {
     id: 'Xenova/whisper-small',
-    name: 'Alta Precisión (Whisper Small)',
+    name: 'Alta Precisión Offline (Whisper Small)',
     size: '~240 MB',
-    desc: 'Máximo detalle en modismos. Requiere teléfono con 6 GB+ de RAM.',
+    desc: 'Mayor precisión sin internet. Requiere 6 GB+ de RAM.',
   },
 ];
 
@@ -104,8 +130,20 @@ export default function App() {
   const [secondaryColor, setSecondaryColor] = useState(
     () => localStorage.getItem('vox_secondary') || '#06B6D4'
   );
+  const [engineMode, setEngineMode] = useState(
+    () => localStorage.getItem('vox_engine_mode') || 'hybrid'
+  );
+  const [groqApiKey, setGroqApiKey] = useState(
+    () => localStorage.getItem('vox_groq_key') || ''
+  );
+  const [groqModel, setGroqModel] = useState(
+    () => localStorage.getItem('vox_groq_model') || 'whisper-large-v3-turbo'
+  );
+  const [showKeyText, setShowKeyText] = useState(false);
+  const [testingGroq, setTestingGroq] = useState(false);
+  const [groqTestStatus, setGroqTestStatus] = useState(null);
   const [modelId, setModelId] = useState(
-    () => localStorage.getItem('vox_model') || 'Xenova/whisper-base'
+    () => localStorage.getItem('vox_model') || 'Xenova/whisper-small'
   );
 
   // Navegación (3 pestañas limpias sin Agenda: Grabar, Diálogos, Notas)
@@ -177,6 +215,18 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('vox_model', modelId);
   }, [modelId]);
+
+  useEffect(() => {
+    localStorage.setItem('vox_engine_mode', engineMode);
+  }, [engineMode]);
+
+  useEffect(() => {
+    localStorage.setItem('vox_groq_key', groqApiKey.trim());
+  }, [groqApiKey]);
+
+  useEffect(() => {
+    localStorage.setItem('vox_groq_model', groqModel);
+  }, [groqModel]);
 
   useEffect(() => {
     localStorage.setItem('vox_glossary', JSON.stringify(customGlossary));
@@ -253,8 +303,8 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
+          echoCancellation: false,
+          noiseSuppression: false,
           autoGainControl: true,
         },
       });
@@ -404,39 +454,77 @@ export default function App() {
     }
 
     try {
-      // 2. Decodificar audio a 16kHz Mono
-      setProcessMessage('Preparando ondas de audio en alta fidelidad...');
+      // 2. Decodificar y normalizar audio a 16kHz Mono para máxima nitidez
+      setProcessMessage('Optimizando volumen y nitidez de la voz...');
       setProcessProgress(14);
-      const { samples, sampleRate, duration } = await decodeAudioTo16kHzMono(blob);
+      const decoded = await decodeAudioTo16kHzMono(blob);
+      const samples = normalizeAudioSamples(decoded.samples);
+      const { sampleRate, duration } = decoded;
 
-      // 3. Ejecutar transcripción neuronal Whisper On-Device
-      const worker = getWorker();
-      const whisperOutput = await new Promise((resolve, reject) => {
-        const handleMsg = (ev) => {
-          const data = ev.data;
-          if (data.id !== sessionId) return;
-          if (data.status === 'loading_model' || data.status === 'downloading') {
-            setProcessMessage(data.message);
-            setProcessProgress(Math.max(18, Math.min(82, data.progress || 35)));
-          } else if (data.status === 'transcribing') {
-            setProcessMessage(data.message);
-            setProcessProgress(86);
-          } else if (data.status === 'done') {
-            worker.removeEventListener('message', handleMsg);
-            resolve(data.result);
-          } else if (data.status === 'error') {
-            worker.removeEventListener('message', handleMsg);
-            reject(new Error(data.error));
-          }
-        };
-        worker.addEventListener('message', handleMsg);
-        worker.postMessage({
-          id: sessionId,
-          type: 'TRANSCRIBE',
-          audioSamples: samples,
-          modelId,
+      // Función auxiliar de respaldo Offline (en el teléfono)
+      const runOfflineTranscription = () =>
+        new Promise((resolve, reject) => {
+          const worker = getWorker();
+          const handleMsg = (ev) => {
+            const data = ev.data;
+            if (data.id !== sessionId) return;
+            if (data.status === 'loading_model' || data.status === 'downloading') {
+              setProcessMessage(data.message);
+              setProcessProgress(Math.max(18, Math.min(82, data.progress || 35)));
+            } else if (data.status === 'transcribing') {
+              setProcessMessage(data.message);
+              setProcessProgress(86);
+            } else if (data.status === 'done') {
+              worker.removeEventListener('message', handleMsg);
+              resolve(data.result);
+            } else if (data.status === 'error') {
+              worker.removeEventListener('message', handleMsg);
+              reject(new Error(data.error));
+            }
+          };
+          worker.addEventListener('message', handleMsg);
+          worker.postMessage({
+            id: sessionId,
+            type: 'TRANSCRIBE',
+            audioSamples: samples,
+            duration,
+            modelId,
+          });
         });
-      });
+
+      // 3. Ejecutar Whisper Large-v3 (Groq Gratis) con respaldo automático Offline
+      let whisperOutput = null;
+      const canUseGroq =
+        engineMode === 'hybrid' && groqApiKey.trim().length > 10 && navigator.onLine !== false;
+
+      if (canUseGroq) {
+        try {
+          setProcessMessage('Conectando con Whisper Large-v3 (98% precisión)...');
+          setProcessProgress(26);
+          whisperOutput = await transcribeWithGroq({
+            samples,
+            sampleRate,
+            duration,
+            apiKey: groqApiKey,
+            model: groqModel,
+            region: selectedRegion,
+            glossary: customGlossary,
+            onProgress: (pct, msg) => {
+              setProcessProgress(pct);
+              setProcessMessage(msg);
+            },
+          });
+        } catch (groqErr) {
+          if (groqErr?.message === 'INVALID_GROQ_KEY') {
+            showToast('Clave Groq inválida: revisa el botón del chip. Usando modo offline...');
+          } else {
+            showToast('Sin acceso a Groq en este momento: cambiando a respaldo offline...');
+          }
+          whisperOutput = await runOfflineTranscription();
+        }
+      } else {
+        whisperOutput = await runOfflineTranscription();
+      }
 
       // 4. Separación automática de Hablante 1, Hablante 2... y análisis de Tono
       setProcessMessage('Separando hablantes y midiendo tonos de voz...');
@@ -505,6 +593,7 @@ export default function App() {
       const completedSession = {
         ...draftSession,
         status: 'ready',
+        engineLabel: whisperOutput?.engineLabel || '📱 Offline Local',
         duration: Number(duration.toFixed(2)),
         durationFormatted: formatMMSS(duration),
         segments: enrichedSegments,
@@ -700,7 +789,9 @@ export default function App() {
           <div>
             <span className="font-bold tracking-wider text-base">VOXLATAM</span>
             <span className={`block text-[10px] leading-none ${mutedTextClass}`}>
-              IA Local · Sin límites
+              {engineMode === 'hybrid' && groqApiKey.trim()
+                ? `${groqModel === 'whisper-large-v3' ? 'Large-v3' : 'Large-v3 Turbo'} · Híbrido`
+                : 'IA Local · Offline'}
             </span>
           </div>
         </div>
@@ -742,6 +833,36 @@ export default function App() {
         {/* PESTAÑA 1: GRABAR */}
         {activeTab === 'record' && (
           <div className="space-y-4">
+            {engineMode === 'hybrid' && !groqApiKey.trim() && (
+              <div
+                className={`rounded-2xl border p-3.5 flex items-center justify-between gap-3 ${surfaceClass}`}
+                style={{ borderColor: `${primaryColor}60` }}
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div
+                    className="w-8 h-8 rounded-xl flex items-center justify-center shrink-0 text-black"
+                    style={gradientStyle}
+                  >
+                    <Zap className="w-4 h-4 fill-current" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold truncate">
+                      Activa Whisper Large-v3 (98% gratis)
+                    </div>
+                    <div className={`text-[11px] truncate ${mutedTextClass}`}>
+                      Pega tu clave gratuita de Groq para precisión exacta
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowEngineModal(true)}
+                  className="px-3 py-1.5 rounded-xl text-[11px] font-bold text-black shrink-0"
+                  style={gradientStyle}
+                >
+                  Activar
+                </button>
+              </div>
+            )}
             {/* Selector de acento regional y glosario */}
             <div>
               <div className="flex items-center justify-between mb-2">
@@ -945,6 +1066,7 @@ export default function App() {
                       <p className={`text-[11px] ${mutedTextClass}`}>
                         {currentSession.region} · {uniqueSpeakers.length} hablante(s) ·{' '}
                         {currentSession.durationFormatted}
+                        {currentSession.engineLabel ? ` · ${currentSession.engineLabel}` : ''}
                       </p>
                     </div>
                     {audioObjectUrl && (
@@ -1345,38 +1467,181 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: Motor IA en el Dispositivo */}
+      {/* MODAL: Motor IA Híbrido (Whisper Large-v3 Gratis + Respaldo Offline) */}
       {showEngineModal && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
-          <div className={`w-full max-w-md rounded-3xl border p-5 space-y-4 ${surfaceClass}`}>
+          <div
+            className={`w-full max-w-md max-h-[88vh] overflow-y-auto rounded-3xl border p-5 space-y-4 ${surfaceClass}`}
+          >
             <div className="flex items-center justify-between">
-              <h3 className="font-bold text-base">Motor IA 100% Gratis (En tu Teléfono)</h3>
+              <h3 className="font-bold text-base">Motor de Transcripción IA</h3>
               <button onClick={() => setShowEngineModal(false)}>
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <p className={`text-xs leading-relaxed ${mutedTextClass}`}>
-              VOXLATAM procesa tus audios directamente en tu celular sin APIs de pago ni límites por
-              minuto. La primera vez descargará el modelo elegido y luego funcionará incluso en modo
-              avión.
-            </p>
+
+            {/* Selector de Modo */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => setEngineMode('hybrid')}
+                className={`p-3 rounded-2xl border flex items-center justify-center gap-1.5 text-xs font-bold transition ${
+                  engineMode === 'hybrid'
+                    ? 'text-black border-transparent'
+                    : isLight
+                    ? 'border-slate-200 text-slate-700'
+                    : 'border-zinc-800 text-zinc-300'
+                }`}
+                style={engineMode === 'hybrid' ? gradientStyle : undefined}
+              >
+                <Zap className="w-4 h-4" />
+                Híbrido (98%)
+              </button>
+              <button
+                onClick={() => setEngineMode('offline')}
+                className={`p-3 rounded-2xl border flex items-center justify-center gap-1.5 text-xs font-bold transition ${
+                  engineMode === 'offline'
+                    ? 'text-black border-transparent'
+                    : isLight
+                    ? 'border-slate-200 text-slate-700'
+                    : 'border-zinc-800 text-zinc-300'
+                }`}
+                style={engineMode === 'offline' ? gradientStyle : undefined}
+              >
+                <WifiOff className="w-4 h-4" />
+                Solo Offline
+              </button>
+            </div>
+
+            {engineMode === 'hybrid' && (
+              <div
+                className={`p-3.5 rounded-2xl border space-y-3 ${
+                  isLight ? 'bg-slate-50 border-slate-200' : 'bg-zinc-950 border-zinc-800'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-bold flex items-center gap-1.5">
+                    <KeyRound className="w-3.5 h-3.5" style={{ color: primaryColor }} />
+                    Clave gratuita de Groq (Sin tarjeta)
+                  </span>
+                  <a
+                    href="https://console.groq.com/keys"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[11px] font-semibold flex items-center gap-1 underline"
+                    style={{ color: primaryColor }}
+                  >
+                    Crear clave
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      type={showKeyText ? 'text' : 'password'}
+                      value={groqApiKey}
+                      onChange={(e) => {
+                        setGroqApiKey(e.target.value);
+                        setGroqTestStatus(null);
+                      }}
+                      placeholder="Pega aquí tu clave gsk_..."
+                      className={`w-full pl-3 pr-9 py-2 rounded-xl border text-xs bg-transparent outline-none font-mono ${
+                        isLight ? 'border-slate-300' : 'border-zinc-700'
+                      }`}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowKeyText((v) => !v)}
+                      className={`absolute right-2.5 top-1/2 -translate-y-1/2 ${mutedTextClass}`}
+                    >
+                      {showKeyText ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={testingGroq}
+                    onClick={async () => {
+                      setTestingGroq(true);
+                      const res = await testGroqConnection(groqApiKey);
+                      setGroqTestStatus(res);
+                      setTestingGroq(false);
+                    }}
+                    className="px-3 py-2 rounded-xl text-xs font-bold text-black shrink-0 disabled:opacity-50"
+                    style={gradientStyle}
+                  >
+                    {testingGroq ? '...' : 'Probar'}
+                  </button>
+                </div>
+
+                {groqTestStatus && (
+                  <p
+                    className={`text-[11px] font-medium ${
+                      groqTestStatus.ok ? 'text-emerald-400' : 'text-rose-400'
+                    }`}
+                  >
+                    {groqTestStatus.ok ? '✓ ' : '✕ '}
+                    {groqTestStatus.message}
+                  </p>
+                )}
+
+                <div className="space-y-1.5 pt-1">
+                  <span className={`text-[11px] font-semibold ${mutedTextClass}`}>
+                    Modelo con internet (2.000 audios gratis/día):
+                  </span>
+                  {GROQ_MODELS.map((gm) => {
+                    const selected = groqModel === gm.id;
+                    return (
+                      <button
+                        key={gm.id}
+                        onClick={() => setGroqModel(gm.id)}
+                        className={`w-full text-left p-2.5 rounded-xl border transition ${
+                          selected
+                            ? 'border-current'
+                            : isLight
+                            ? 'border-slate-200'
+                            : 'border-zinc-800'
+                        }`}
+                        style={selected ? { borderColor: primaryColor } : undefined}
+                      >
+                        <div className="flex items-center justify-between text-xs font-bold">
+                          <span>{gm.name}</span>
+                          <span className="text-[10px]" style={{ color: primaryColor }}>
+                            {gm.tag}
+                          </span>
+                        </div>
+                        <p className={`text-[11px] mt-0.5 ${mutedTextClass}`}>{gm.desc}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Respaldo Offline */}
             <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold">
+                  {engineMode === 'hybrid'
+                    ? 'Respaldo automático si estás sin señal:'
+                    : 'Modelo Offline (en tu teléfono):'}
+                </span>
+              </div>
               {MODELS.map((m) => {
                 const selected = modelId === m.id;
                 return (
                   <button
                     key={m.id}
                     onClick={() => setModelId(m.id)}
-                    className={`w-full text-left p-3 rounded-2xl border transition ${
+                    className={`w-full text-left p-2.5 rounded-2xl border transition ${
                       selected ? 'border-current' : isLight ? 'border-slate-200' : 'border-zinc-800'
                     }`}
-                    style={selected ? { borderColor: primaryColor } : undefined}
+                    style={selected ? { borderColor: secondaryColor } : undefined}
                   >
                     <div className="flex items-center justify-between text-xs font-bold">
                       <span>{m.name}</span>
-                      <span style={{ color: primaryColor }}>{m.size}</span>
+                      <span style={{ color: secondaryColor }}>{m.size}</span>
                     </div>
-                    <p className={`text-[11px] mt-1 ${mutedTextClass}`}>{m.desc}</p>
+                    <p className={`text-[11px] mt-0.5 ${mutedTextClass}`}>{m.desc}</p>
                   </button>
                 );
               })}
