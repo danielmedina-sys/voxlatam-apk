@@ -1,10 +1,10 @@
 import { REGIONAL_LEXICON, formatMMSS } from './audioUtils';
 
-const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+const AI_STUDIO_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+const VERTEX_EXPRESS_BASE = 'https://aiplatform.googleapis.com/v1/publishers/google';
 
-// Modelos priorizados: primero el más reciente (3.8) y los anteriores solo como respaldo
+// Modelos priorizados por estabilidad en capa gratuita y precisión en audio español
 const DEFAULT_FALLBACK_MODELS = [
-  'gemini-3.8-flash',
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
@@ -20,7 +20,6 @@ const TONE_MAP = {
 };
 
 const MODEL_LABELS = {
-  'gemini-3.8-flash': '🚀 Gemini 3.8 Flash',
   'gemini-2.5-flash': '✨ Gemini 2.5 Flash',
   'gemini-2.5-flash-lite': '⚡ Gemini 2.5 Lite',
   'gemini-2.0-flash': '✨ Gemini 2.0 Flash',
@@ -28,6 +27,19 @@ const MODEL_LABELS = {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isVertexExpressKey(apiKey) {
+  return String(apiKey || '').trim().startsWith('AQ.');
+}
+
+function buildGenerateUrl(modelName, apiKey, useVertex) {
+  const safeModel = encodeURIComponent(modelName);
+  const safeKey = encodeURIComponent(apiKey);
+  if (useVertex) {
+    return `${VERTEX_EXPRESS_BASE}/models/${safeModel}:generateContent?key=${safeKey}`;
+  }
+  return `${AI_STUDIO_BASE}/models/${safeModel}:generateContent?key=${safeKey}`;
 }
 
 function getCleanMimeType(blob, fileName = '') {
@@ -180,16 +192,80 @@ function getDiscoveredModels() {
 export async function testGeminiConnection(apiKey) {
   const cleanKey = (apiKey || '').trim();
   if (!cleanKey) {
-    return { ok: false, message: 'Pega tu API Key de Google AI Studio (empieza por AIza...).' };
+    return { ok: false, message: 'Pega tu clave de Google (AIza... o AQ.).' };
   }
 
+  // Detección automática para claves AQ. (Vertex AI Express Mode)
+  if (isVertexExpressKey(cleanKey)) {
+    let sawBusy = false;
+    let lastMsg = '';
+
+    for (const modelName of DEFAULT_FALLBACK_MODELS) {
+      try {
+        const res = await fetch(buildGenerateUrl(modelName, cleanKey, true), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: 'Responde solo OK' }] }],
+            generationConfig: { maxOutputTokens: 5 },
+          }),
+        });
+
+        if (res.ok) {
+          return {
+            ok: true,
+            models: DEFAULT_FALLBACK_MODELS,
+            message: `Conectado a Vertex AI Express (${modelName} listo con rotación automática).`,
+          };
+        }
+
+        let errMsg = '';
+        try {
+          const errJson = await res.json();
+          errMsg = errJson?.error?.message || '';
+        } catch {
+          // ignore
+        }
+
+        if (res.status === 401 || res.status === 403) {
+          return {
+            ok: false,
+            message:
+              errMsg || 'Clave AQ. inválida, vencida o sin permisos activos en Vertex AI.',
+          };
+        }
+        if (res.status === 429 || res.status === 503) {
+          sawBusy = true;
+          continue;
+        }
+        lastMsg = errMsg || `Estado ${res.status}`;
+      } catch {
+        return { ok: false, message: 'Sin conexión a internet para verificar la clave.' };
+      }
+    }
+
+    if (sawBusy) {
+      return {
+        ok: true,
+        models: DEFAULT_FALLBACK_MODELS,
+        message: 'Clave AQ. reconocida (servidores con alta demanda temporal; rotará automáticamente).',
+      };
+    }
+
+    return {
+      ok: false,
+      message: `No se pudo validar la clave AQ. (${lastMsg || 'revisa que esté activa en Vertex AI'}).`,
+    };
+  }
+
+  // Flujo estándar para claves AIza... (Google AI Studio)
   try {
-    const res = await fetch(`${GEMINI_API_BASE}/models?key=${encodeURIComponent(cleanKey)}`);
+    const res = await fetch(`${AI_STUDIO_BASE}/models?key=${encodeURIComponent(cleanKey)}`);
     if (!res.ok) {
       if (res.status === 400 || res.status === 401 || res.status === 403) {
         return {
           ok: false,
-          message: 'Clave inválida o sin permisos. Verifica que la copiaste completa desde AI Studio.',
+          message: 'Clave inválida o sin permisos. Verifica que la copiaste completa.',
         };
       }
       return { ok: false, message: `Google respondió con estado ${res.status}. Intenta de nuevo.` };
@@ -258,14 +334,13 @@ async function uploadLargeAudioToGemini(blob, mimeType, apiKey) {
     throw new Error('UPLOAD_NO_URI');
   }
 
-  // Esperar brevemente si el archivo grande está procesándose en servidor
   let current = fileInfo;
   let tries = 0;
   while (current.state === 'PROCESSING' && tries < 10) {
     await sleep(1200);
     tries++;
     const check = await fetch(
-      `${GEMINI_API_BASE}/${current.name}?key=${encodeURIComponent(apiKey)}`
+      `${AI_STUDIO_BASE}/${current.name}?key=${encodeURIComponent(apiKey)}`
     );
     if (check.ok) {
       current = await check.json();
@@ -280,7 +355,7 @@ async function uploadLargeAudioToGemini(blob, mimeType, apiKey) {
 async function deleteUploadedGeminiFile(fileName, apiKey) {
   if (!fileName) return;
   try {
-    await fetch(`${GEMINI_API_BASE}/${fileName}?key=${encodeURIComponent(apiKey)}`, {
+    await fetch(`${AI_STUDIO_BASE}/${fileName}?key=${encodeURIComponent(apiKey)}`, {
       method: 'DELETE',
     });
   } catch {
@@ -288,8 +363,8 @@ async function deleteUploadedGeminiFile(fileName, apiKey) {
   }
 }
 
-function buildModelQueue(preferredModel) {
-  const discovered = getDiscoveredModels();
+function buildModelQueue(preferredModel, useVertex) {
+  const discovered = useVertex ? [] : getDiscoveredModels();
   const list = [];
 
   if (preferredModel && preferredModel !== 'auto') {
@@ -320,6 +395,7 @@ export async function transcribeWithGemini({
     throw new Error('NO_GEMINI_KEY');
   }
 
+  const useVertex = isVertexExpressKey(cleanKey);
   const mimeType = getCleanMimeType(blob, fileName);
   const promptText = buildUnifiedPrompt(region, glossary, speakerMode, duration);
 
@@ -327,24 +403,27 @@ export async function transcribeWithGemini({
   let uploadedFileName = null;
 
   try {
-    // Audios <= 14 MB (hasta ~45 min en voz comprimida) se envían en 1 sola petición directa
-    if (blob.size <= 14 * 1024 * 1024) {
+    const inlineLimitBytes = useVertex ? 15 * 1024 * 1024 : 14 * 1024 * 1024;
+
+    if (blob.size <= inlineLimitBytes) {
       if (onProgress) onProgress(30, 'Preparando audio en una sola petición optimizada...');
       const b64 = await blobToBase64(blob);
       audioPart = {
-        inline_data: {
-          mime_type: mimeType,
+        inlineData: {
+          mimeType,
           data: b64,
         },
       };
+    } else if (useVertex) {
+      throw new Error('AUDIO_TOO_LARGE_FOR_VERTEX_INLINE');
     } else {
       if (onProgress) onProgress(28, 'Subiendo audio extenso a Google AI Studio...');
       const uploaded = await uploadLargeAudioToGemini(blob, mimeType, cleanKey);
       uploadedFileName = uploaded.name || null;
       audioPart = {
-        file_data: {
-          mime_type: uploaded.mimeType || mimeType,
-          file_uri: uploaded.uri,
+        fileData: {
+          mimeType: uploaded.mimeType || mimeType,
+          fileUri: uploaded.uri,
         },
       };
     }
@@ -362,7 +441,7 @@ export async function transcribeWithGemini({
       },
     };
 
-    const queue = buildModelQueue(preferredModel);
+    const queue = buildModelQueue(preferredModel, useVertex);
     let lastError = null;
     let successfulData = null;
     let usedModel = queue[0];
@@ -380,9 +459,7 @@ export async function transcribeWithGemini({
         );
       }
 
-      const url = `${GEMINI_API_BASE}/models/${encodeURIComponent(
-        modelName
-      )}:generateContent?key=${encodeURIComponent(cleanKey)}`;
+      const url = buildGenerateUrl(modelName, cleanKey, useVertex);
 
       let response;
       try {
@@ -391,7 +468,7 @@ export async function transcribeWithGemini({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody),
         });
-      } catch (netErr) {
+      } catch {
         lastError = new Error('NETWORK_ERROR');
         break;
       }
@@ -421,7 +498,6 @@ export async function transcribeWithGemini({
         continue;
       }
 
-      // 429 (Cuota), 503 (Alta demanda), 404 (Modelo no disponible): rotar silenciosamente al respaldo
       if (response.status === 429 || response.status === 503 || response.status === 404) {
         lastError = new Error(`MODEL_BUSY_${response.status}`);
         if (i < queue.length - 1) {
@@ -446,7 +522,6 @@ export async function transcribeWithGemini({
     const parsed = extractJsonPayload(rawText);
     const rawSegments = Array.isArray(parsed.segments) ? parsed.segments : [];
 
-    // Normalizar orden de hablantes: Hablante 1, Hablante 2...
     const speakerOrder = new Map();
     let spkCounter = 1;
 
@@ -490,7 +565,9 @@ export async function transcribeWithGemini({
       detectedSlang: Array.isArray(parsed.detected_slang)
         ? parsed.detected_slang.map((w) => String(w).trim()).filter(Boolean)
         : [],
-      engineLabel: MODEL_LABELS[usedModel] || `✨ ${usedModel}`,
+      engineLabel: useVertex
+        ? `${MODEL_LABELS[usedModel] || usedModel} (Vertex)`
+        : MODEL_LABELS[usedModel] || `✨ ${usedModel}`,
     };
   } finally {
     if (uploadedFileName) {

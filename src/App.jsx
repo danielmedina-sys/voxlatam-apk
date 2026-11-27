@@ -1596,7 +1596,7 @@ export default function App() {
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-bold flex items-center gap-1.5">
                     <KeyRound className="w-3.5 h-3.5" style={{ color: primaryColor }} />
-                    API Key de Google AI Studio
+                    Clave API de Google (AQ. / AIza)
                   </span>
                   <a
                     href="https://aistudio.google.com/app/apikey"
@@ -1619,7 +1619,7 @@ export default function App() {
                         setGeminiApiKey(e.target.value);
                         setGeminiTestStatus(null);
                       }}
-                      placeholder="Pega aquí tu clave AIza..."
+                      placeholder="Pega tu clave AQ. o AIza..."
                       className={`w-full pl-3 pr-9 py-2 rounded-xl border text-xs bg-transparent outline-none font-mono ${
                         isLight ? 'border-slate-300' : 'border-zinc-700'
                       }`}
