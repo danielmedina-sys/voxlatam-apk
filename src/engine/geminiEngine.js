@@ -1,14 +1,12 @@
 import { REGIONAL_LEXICON, formatMMSS } from './audioUtils';
 
 const AI_STUDIO_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-const VERTEX_EXPRESS_BASE = 'https://aiplatform.googleapis.com/v1/publishers/google';
 
-// Modelos priorizados: primero el más reciente (3.8) y los anteriores solo como respaldo
+// Modelos priorizados: primero el más reciente (3.8) y respaldo automático si hay alta demanda
 const DEFAULT_FALLBACK_MODELS = [
   'gemini-3.8-flash',
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
-  'gemini-2.0-flash',
 ];
 
 const TONE_MAP = {
@@ -24,24 +22,10 @@ const MODEL_LABELS = {
   'gemini-3.8-flash': '🚀 Gemini 3.8 Flash',
   'gemini-2.5-flash': '✨ Gemini 2.5 Flash',
   'gemini-2.5-flash-lite': '⚡ Gemini 2.5 Lite',
-  'gemini-2.0-flash': '✨ Gemini 2.0 Flash',
 };
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isVertexExpressKey(apiKey) {
-  return String(apiKey || '').trim().startsWith('AQ.');
-}
-
-function buildGenerateUrl(modelName, apiKey, useVertex) {
-  const safeModel = encodeURIComponent(modelName);
-  const safeKey = encodeURIComponent(apiKey);
-  if (useVertex) {
-    return `${VERTEX_EXPRESS_BASE}/models/${safeModel}:generateContent?key=${safeKey}`;
-  }
-  return `${AI_STUDIO_BASE}/models/${safeModel}:generateContent?key=${safeKey}`;
 }
 
 function getCleanMimeType(blob, fileName = '') {
@@ -194,83 +178,38 @@ function getDiscoveredModels() {
 export async function testGeminiConnection(apiKey) {
   const cleanKey = (apiKey || '').trim();
   if (!cleanKey) {
-    return { ok: false, message: 'Pega tu clave de Google (AIza... o AQ.).' };
+    return { ok: false, message: 'Pega tu clave de Google AI Studio (empieza por AQ. o AIza...).' };
   }
 
-  // Detección automática para claves AQ. (Vertex AI Express Mode)
-  if (isVertexExpressKey(cleanKey)) {
-    let sawBusy = false;
-    let lastMsg = '';
-
-    for (const modelName of DEFAULT_FALLBACK_MODELS) {
-      try {
-        const res = await fetch(buildGenerateUrl(modelName, cleanKey, true), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: 'Responde solo OK' }] }],
-            generationConfig: { maxOutputTokens: 5 },
-          }),
-        });
-
-        if (res.ok) {
-          return {
-            ok: true,
-            models: DEFAULT_FALLBACK_MODELS,
-            message: `Conectado a Vertex AI Express (${modelName} listo con rotación automática).`,
-          };
-        }
-
-        let errMsg = '';
-        try {
-          const errJson = await res.json();
-          errMsg = errJson?.error?.message || '';
-        } catch {
-          // ignore
-        }
-
-        if (res.status === 401 || res.status === 403) {
-          return {
-            ok: false,
-            message:
-              errMsg || 'Clave AQ. inválida, vencida o sin permisos activos en Vertex AI.',
-          };
-        }
-        if (res.status === 429 || res.status === 503) {
-          sawBusy = true;
-          continue;
-        }
-        lastMsg = errMsg || `Estado ${res.status}`;
-      } catch {
-        return { ok: false, message: 'Sin conexión a internet para verificar la clave.' };
-      }
-    }
-
-    if (sawBusy) {
-      return {
-        ok: true,
-        models: DEFAULT_FALLBACK_MODELS,
-        message: 'Clave AQ. reconocida (servidores con alta demanda temporal; rotará automáticamente).',
-      };
-    }
-
-    return {
-      ok: false,
-      message: `No se pudo validar la clave AQ. (${lastMsg || 'revisa que esté activa en Vertex AI'}).`,
-    };
-  }
-
-  // Flujo estándar para claves AIza... (Google AI Studio)
   try {
-    const res = await fetch(`${AI_STUDIO_BASE}/models?key=${encodeURIComponent(cleanKey)}`);
+    // Usar cabecera x-goog-api-key (requerida oficialmente para las nuevas claves AQ. de AI Studio)
+    const res = await fetch(`${AI_STUDIO_BASE}/models`, {
+      method: 'GET',
+      headers: {
+        'x-goog-api-key': cleanKey,
+      },
+    });
+
     if (!res.ok) {
+      let errMsg = '';
+      try {
+        const errJson = await res.json();
+        errMsg = errJson?.error?.message || '';
+      } catch {
+        // ignorar
+      }
       if (res.status === 400 || res.status === 401 || res.status === 403) {
         return {
           ok: false,
-          message: 'Clave inválida o sin permisos. Verifica que la copiaste completa.',
+          message:
+            errMsg ||
+            'Clave inválida. Abre el detalle de la clave en Google AI Studio y usa el botón "Copiar clave" (debe tener ~53 caracteres).',
         };
       }
-      return { ok: false, message: `Google respondió con estado ${res.status}. Intenta de nuevo.` };
+      return {
+        ok: false,
+        message: `Google respondió con estado ${res.status}${errMsg ? `: ${errMsg}` : ''}.`,
+      };
     }
 
     const data = await res.json();
@@ -289,13 +228,14 @@ export async function testGeminiConnection(apiKey) {
           !name.includes('exp')
         );
       })
-      .map((m) => String(m.name || '').replace(/^models\//, ''));
+      .map((m) => String(m.name || '').replace(/^models\//, ''))
+      .sort((a, b) => b.localeCompare(a));
 
     if (flashModels.length > 0) {
       try {
         localStorage.setItem('vox_gemini_discovered', JSON.stringify(flashModels.slice(0, 6)));
       } catch {
-        // Ignorar si localStorage falla
+        // ignorar
       }
     }
 
@@ -304,7 +244,7 @@ export async function testGeminiConnection(apiKey) {
       models: flashModels,
       message:
         flashModels.length > 0
-          ? `Conectado a Google AI Studio (${flashModels.length} modelos Flash listos con respaldo automático).`
+          ? `Conectado a Google AI Studio (${flashModels.length} modelos Flash listos: ${flashModels[0]}).`
           : 'Conectado correctamente a Google AI Studio.',
     };
   } catch {
@@ -314,13 +254,12 @@ export async function testGeminiConnection(apiKey) {
 
 async function uploadLargeAudioToGemini(blob, mimeType, apiKey) {
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=media&key=${encodeURIComponent(
-      apiKey
-    )}`,
+    '[https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=media](https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=media)',
     {
       method: 'POST',
       headers: {
         'Content-Type': mimeType,
+        'x-goog-api-key': apiKey,
       },
       body: blob,
     }
@@ -341,9 +280,9 @@ async function uploadLargeAudioToGemini(blob, mimeType, apiKey) {
   while (current.state === 'PROCESSING' && tries < 10) {
     await sleep(1200);
     tries++;
-    const check = await fetch(
-      `${AI_STUDIO_BASE}/${current.name}?key=${encodeURIComponent(apiKey)}`
-    );
+    const check = await fetch(`${AI_STUDIO_BASE}/${current.name}`, {
+      headers: { 'x-goog-api-key': apiKey },
+    });
     if (check.ok) {
       current = await check.json();
     } else {
@@ -357,16 +296,17 @@ async function uploadLargeAudioToGemini(blob, mimeType, apiKey) {
 async function deleteUploadedGeminiFile(fileName, apiKey) {
   if (!fileName) return;
   try {
-    await fetch(`${AI_STUDIO_BASE}/${fileName}?key=${encodeURIComponent(apiKey)}`, {
+    await fetch(`${AI_STUDIO_BASE}/${fileName}`, {
       method: 'DELETE',
+      headers: { 'x-goog-api-key': apiKey },
     });
   } catch {
-    // Limpieza opcional silenciosa
+    // Limpieza silenciosa
   }
 }
 
-function buildModelQueue(preferredModel, useVertex) {
-  const discovered = useVertex ? [] : getDiscoveredModels();
+function buildModelQueue(preferredModel) {
+  const discovered = getDiscoveredModels();
   const list = [];
 
   if (preferredModel && preferredModel !== 'auto') {
@@ -397,7 +337,6 @@ export async function transcribeWithGemini({
     throw new Error('NO_GEMINI_KEY');
   }
 
-  const useVertex = isVertexExpressKey(cleanKey);
   const mimeType = getCleanMimeType(blob, fileName);
   const promptText = buildUnifiedPrompt(region, glossary, speakerMode, duration);
 
@@ -405,9 +344,7 @@ export async function transcribeWithGemini({
   let uploadedFileName = null;
 
   try {
-    const inlineLimitBytes = useVertex ? 15 * 1024 * 1024 : 14 * 1024 * 1024;
-
-    if (blob.size <= inlineLimitBytes) {
+    if (blob.size <= 14 * 1024 * 1024) {
       if (onProgress) onProgress(30, 'Preparando audio en una sola petición optimizada...');
       const b64 = await blobToBase64(blob);
       audioPart = {
@@ -416,8 +353,6 @@ export async function transcribeWithGemini({
           data: b64,
         },
       };
-    } else if (useVertex) {
-      throw new Error('AUDIO_TOO_LARGE_FOR_VERTEX_INLINE');
     } else {
       if (onProgress) onProgress(28, 'Subiendo audio extenso a Google AI Studio...');
       const uploaded = await uploadLargeAudioToGemini(blob, mimeType, cleanKey);
@@ -443,7 +378,7 @@ export async function transcribeWithGemini({
       },
     };
 
-    const queue = buildModelQueue(preferredModel, useVertex);
+    const queue = buildModelQueue(preferredModel);
     let lastError = null;
     let successfulData = null;
     let usedModel = queue[0];
@@ -461,13 +396,16 @@ export async function transcribeWithGemini({
         );
       }
 
-      const url = buildGenerateUrl(modelName, cleanKey, useVertex);
+      const url = `${AI_STUDIO_BASE}/models/${encodeURIComponent(modelName)}:generateContent`;
 
       let response;
       try {
         response = await fetch(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': cleanKey,
+          },
           body: JSON.stringify(requestBody),
         });
       } catch {
@@ -500,6 +438,7 @@ export async function transcribeWithGemini({
         continue;
       }
 
+      // 429 (Cuota), 503 (Alta demanda), 404 (Modelo no disponible): rotar silenciosamente al respaldo
       if (response.status === 429 || response.status === 503 || response.status === 404) {
         lastError = new Error(`MODEL_BUSY_${response.status}`);
         if (i < queue.length - 1) {
@@ -567,9 +506,7 @@ export async function transcribeWithGemini({
       detectedSlang: Array.isArray(parsed.detected_slang)
         ? parsed.detected_slang.map((w) => String(w).trim()).filter(Boolean)
         : [],
-      engineLabel: useVertex
-        ? `${MODEL_LABELS[usedModel] || usedModel} (Vertex)`
-        : MODEL_LABELS[usedModel] || `✨ ${usedModel}`,
+      engineLabel: MODEL_LABELS[usedModel] || `✨ ${usedModel}`,
     };
   } finally {
     if (uploadedFileName) {
